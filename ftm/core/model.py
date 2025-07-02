@@ -1394,15 +1394,6 @@ class SimulateTakeOff():
     and not self.rampup[t_idx-1]:
       self.frac_compute_training[t_idx] = self.frac_compute_training[t_idx-1]
 
-    # ------------------------------------------------------------------------------------------------------------------
-    # Training compute shut-off after cool-down
-    # ------------------------------------------------------------------------------------------------------------------
-    # Once the economy enters a cool-down phase (or if it has been in cool-down before),
-    # we assume that scaling up model size is no longer economically attractive.  We
-    # therefore set the fraction of compute devoted to training to zero **permanently**.
-    if self.cooldown[t_idx] or (t_idx > 0 and self.frac_compute_training[t_idx-1] == 0):
-      self.frac_compute_training[t_idx] = 0.0
-
     # Goods production fractional inputs
     self.frac_capital_goods[t_idx] = \
       1 - self.frac_capital_hardware_rnd[t_idx]
