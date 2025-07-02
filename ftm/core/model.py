@@ -145,6 +145,21 @@ class SimulateTakeOff():
 
       # Metadata / feature flags
       runtime_training_tradeoff_enabled = True,
+
+      # Fractional inputs cooldown growth rates
+      frac_capital_hardware_rnd_growth_cooldown = 0,
+      frac_labour_hardware_rnd_growth_cooldown = 0,
+      frac_compute_hardware_rnd_growth_cooldown = 0,
+
+      frac_labour_software_rnd_growth_cooldown = 0,
+      frac_compute_software_rnd_growth_cooldown = 0,
+
+      frac_gwp_compute_growth_cooldown = -0.05,
+      frac_compute_training_growth_cooldown = -0.25,
+
+      # Cool-down trigger parameters
+      cooldown_threshold = 0.25,
+      cooldown_window = 2,
       ):
 
     if t_start is None: t_start = get_option('t_start', 2022)
@@ -395,6 +410,7 @@ class SimulateTakeOff():
     self.state_def.rampup = self.state_var(dtype=bool)
     self.rampup_start = None
     self.rampup_mid = None
+    self.cooldown_start = None  # first timestep entering cooldown
 
     # Goods vs compute investment split
     self.state_def.frac_gwp_compute = self.state_var()
@@ -414,6 +430,9 @@ class SimulateTakeOff():
     self.state_def.frac_capital_goods = self.state_var()
     self.state_def.frac_labour_goods = self.state_var()
     self.state_def.frac_compute_goods = self.state_var()
+
+    # Cool-down phase indicator (mirrors ramp-up but for slow automation periods)
+    self.state_def.cooldown = self.state_var(dtype=bool)
 
   def create_simulation_state_total_input(self):
     self.state_def.capital = self.state_var()
@@ -725,6 +744,9 @@ class SimulateTakeOff():
     self.frac_compute_goods[0] = \
       1 - self.frac_compute_hardware_rnd[0] - self.frac_compute_software_rnd[0] \
         - self.frac_compute_training[0]
+
+    # Initialise cool-down state
+    self.cooldown[0] = False
 
   #############################################################################
 
@@ -1301,14 +1323,48 @@ class SimulateTakeOff():
     not self.frac_automatable_tasks_goods_no_tradeoff[t_idx-2] >= 1:
       self.agi_year = t_year
 
-    def update_frac_input(current_frac, growth_param, growth_param_rampup, max_frac):
-      # Select the appropriate growth parameter (normal vs ramp-up) and
-      # convert it to a numeric value for the current timestep.
-      rate = self._param_value(
-        growth_param_rampup if self.rampup[t_idx] else growth_param,
-        t_idx,
-        t_year,
-      )
+    # ------------------------------------------------------------
+    # Cool-down detection: check relative increase in automation
+    # over a window *T* years. If the increase is below a threshold
+    # *x*, mark the current timestep as being in cool-down.
+    # ------------------------------------------------------------
+
+    cooldown_window = getattr(self, 'cooldown_window', 1.0)      # years
+    cooldown_threshold = getattr(self, 'cooldown_threshold', 0.05)  # 5 % relative
+
+    prev_cool = self.cooldown[t_idx-1] if t_idx > 1 else False
+    self.cooldown[t_idx] = False
+    window_idx = int(round(cooldown_window / self.t_step))
+    if t_idx - 1 - window_idx >= 0:
+      auto_now = self.frac_tasks_automated_goods[t_idx-1]
+
+      # Do not enter cool-down once the economy is fully automated
+      if auto_now < 1.0:
+        auto_prev = self.frac_tasks_automated_goods[t_idx-1-window_idx]
+        if auto_prev > 0:
+          rel_inc = (auto_now - auto_prev) / auto_prev
+        else:
+          rel_inc = np.inf  # Treat as large increase if base is ~0
+
+        self.cooldown[t_idx] = rel_inc < cooldown_threshold
+
+        # Store the first calendar year that cooldown begins
+        if self.cooldown[t_idx] and not prev_cool:
+          self.cooldown_start = t_year
+      else:
+        # Fully automated – never cool down afterwards
+        self.cooldown[t_idx] = False
+
+    def update_frac_input(current_frac, growth_param, growth_param_rampup, growth_param_cooldown, max_frac):
+      """Update a fractional input under normal, ramp-up, or cool-down."""
+      if self.rampup[t_idx]:
+        selected = growth_param_rampup
+      elif self.cooldown[t_idx]:
+        selected = growth_param_cooldown
+      else:
+        selected = growth_param
+
+      rate = self._param_value(selected, t_idx, t_year)
       frac = current_frac * np.exp(self.t_step * rate)
       return min(frac, max_frac)
 
@@ -1324,18 +1380,28 @@ class SimulateTakeOff():
       ]
 
     for frac_metric in frac_metrics:
-      getattr(self, frac_metric)[t_idx] =\
+      getattr(self, frac_metric)[t_idx] = \
         update_frac_input(
-          getattr(self,frac_metric)[t_idx-1],
-          getattr(self,f'{frac_metric}_growth'),
-          getattr(self,f'{frac_metric}_growth_rampup'),
-          getattr(self,f'{frac_metric}_ceiling'),
-          )
+          getattr(self, frac_metric)[t_idx-1],
+          getattr(self, f'{frac_metric}_growth'),
+          getattr(self, f'{frac_metric}_growth_rampup'),
+          getattr(self, f'{frac_metric}_growth_cooldown', 0),
+          getattr(self, f'{frac_metric}_ceiling'),
+        )
 
     # Cap the growth of the fraction of FLOP before rampup
     if self.money_spent_training[t_idx-1] > self.money_cap_training_before_wakeup \
     and not self.rampup[t_idx-1]:
       self.frac_compute_training[t_idx] = self.frac_compute_training[t_idx-1]
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Training compute shut-off after cool-down
+    # ------------------------------------------------------------------------------------------------------------------
+    # Once the economy enters a cool-down phase (or if it has been in cool-down before),
+    # we assume that scaling up model size is no longer economically attractive.  We
+    # therefore set the fraction of compute devoted to training to zero **permanently**.
+    if self.cooldown[t_idx] or (t_idx > 0 and self.frac_compute_training[t_idx-1] == 0):
+      self.frac_compute_training[t_idx] = 0.0
 
     # Goods production fractional inputs
     self.frac_capital_goods[t_idx] = \
@@ -1901,6 +1967,13 @@ class SimulateTakeOff():
                 color=line_color,
                 label='100% automation')
 
+    # Cool-down start vertical line
+    if getattr(self, 'cooldown_start', None) is not None:
+      plt.axvline(self.cooldown_start,
+                linestyle='solid',
+                color=line_color,
+                label='Cool-down')
+
   def plot_compute_decomposition(self, new_figure = True, crop_after_full_automation = True, crop_at_year = None):
     """ Show the growth of the factors that drive compute
     """
@@ -2143,15 +2216,43 @@ if __name__ == "__main__":
     parameter_table = get_parameter_table(tradeoff_enabled="from_spreadsheet")
     best_guess_parameters = {parameter : row['Best guess'] for parameter, row in parameter_table.iterrows()}
     model = SimulateTakeOff(**best_guess_parameters)
+    # Ensure `title` is always defined so that plot customisations work
+    title = getattr(model, 'title', None)
 
   model.run_simulation()
 
+  # ----------------------------
+  # Plot customisation settings
+  # ----------------------------
+  # If the JSON title corresponds to the "updated_conservative" scenario we want
+  # dedicated plot styling: only show every 5 calendar years on the x-axis and
+  # truncate all figures at (calendar) year 2050.
+  updated_conservative = (title == 'updated_conservative')
+  _YEAR_SHIFT = 3  # All existing plots display years shifted by +3
+  _PLOT_CAP_YEAR = 2050
+  _PLOT_CAP_X = _PLOT_CAP_YEAR - _YEAR_SHIFT  # coordinate after shift
+
+  def _customise_axis(ax):
+    """Apply the special x-axis formatting for the updated_conservative case."""
+    if not updated_conservative:
+      return
+    # Show a label every 5 years and cap the visible range.
+    ax.xaxis.set_major_locator(_mticker.MultipleLocator(5))
+    # Preserve existing left bound if present but cap the right bound.
+    xmin, xmax = ax.get_xlim()
+    xmin = xmin  # keep whatever is already set
+    ax.set_xlim(left=xmin, right=min(xmax, _PLOT_CAP_X))
+
+  # -------------------------------------------------------------------------
+  # Plot things
+  # -------------------------------------------------------------------------
   # Plot things
   model.plot('gwp', year_shift=3)
   # Label the main GWP curve for the legend
   if plt.gca().lines:
     plt.gca().lines[0].set_label('GWP')
   plt.legend()
+  _customise_axis(plt.gca())
 
   # Save the figure (do not display it)
   import os
@@ -2180,8 +2281,11 @@ if __name__ == "__main__":
   ax = plt.gca()
   ax.xaxis.set_major_formatter(_mticker.FuncFormatter(lambda val, pos: f"{int(val + 3)}"))
   ax.xaxis.set_major_locator(_mticker.MultipleLocator(1))
+  # Y-axis: ticks every 5 percentage points
+  ax.yaxis.set_major_locator(_mticker.MultipleLocator(5))
   plt.legend()
   plt.title('Automation percentage over time')
+  _customise_axis(ax)
 
   plt.savefig(os.path.join(plot_dir, 'automation_percent.png'), dpi=300, bbox_inches='tight')
   plt.close('all')
@@ -2191,10 +2295,26 @@ if __name__ == "__main__":
   # Largest training run plot (FLOP per year)
   plt.figure(figsize=(14,8), dpi=80)
   # Cap the x-axis at the year 2035 (or end of simulation if sooner)
-  cap_year = 2035
+  cap_year = 2050 if updated_conservative else 2035
   idx_end_lr = min(model.time_to_index(cap_year), model.t_idx)
   x = model.timesteps[:idx_end_lr]
   plt.plot(x, model.biggest_training_run[:idx_end_lr], color='green', label='Largest training run')
+  # Highlight peak and plateau if the series declines afterwards
+  y_lr = model.biggest_training_run[:idx_end_lr]
+  if len(y_lr) > 1:
+    peak_idx = int(np.argmax(y_lr))
+    peak_y = y_lr[peak_idx]
+    # Check whether the series declines after the peak
+    if peak_idx < len(y_lr) - 1 and y_lr[-1] < peak_y:
+      peak_x = x[peak_idx]
+      # Draw a horizontal dashed line from the peak to the end of the visible range
+      plt.hlines(peak_y, peak_x, x[-1], colors='red', linestyles='dashed', label='Peak largest run')
+      # Annotate the peak value (slightly above the line to avoid overlap)
+      plt.annotate(f"Peak: {peak_y:.2e}",
+                   xy=(peak_x, peak_y),
+                   xytext=(peak_x, peak_y * 1.1),
+                   arrowprops=dict(arrowstyle='->', color='red'),
+                   color='red')
   # Use logarithmic scale so the curve isn't squashed near zero and set a sensible lower bound
   plt.yscale('log')
   if len(model.biggest_training_run) > 0:
@@ -2211,5 +2331,53 @@ if __name__ == "__main__":
   # Add vertical milestone lines (wake-up, 20 % & 100 % automation)
   model._plot_vlines()
   plt.legend()
+  _customise_axis(ax)
   plt.savefig(os.path.join(plot_dir, 'largest_training_run.png'), dpi=300, bbox_inches='tight')
   plt.close('all')
+
+  # ----------------------------
+  # GWP yearly growth rate plot
+  # ----------------------------
+  delta_idx = int(1 / model.t_step)
+  cap_year_growth = 2050 if updated_conservative else 2035
+  idx_end_growth = min(model.time_to_index(cap_year_growth), model.t_idx)
+
+  x_growth = model.timesteps[delta_idx:idx_end_growth]
+  y_growth = np.log(model.gwp[delta_idx:idx_end_growth] / model.gwp[:idx_end_growth-delta_idx])
+
+  plt.figure(figsize=(14, 8), dpi=80)
+  plt.plot(x_growth, y_growth, color='black', label='GWP growth')
+  model._plot_vlines()
+
+  ax = plt.gca()
+  ax.xaxis.set_major_formatter(_mticker.FuncFormatter(lambda val, pos: f"{int(val + 3)}"))
+  # Use 2-year ticks to avoid crowded labels
+  ax.xaxis.set_major_locator(_mticker.MultipleLocator(2))
+  plt.legend()
+  plt.title('GWP yearly growth rate')
+  plt.ylabel('ln growth per year')
+  _customise_axis(ax)
+  plt.savefig(os.path.join(plot_dir, 'gwp_growth.png'), dpi=300, bbox_inches='tight')
+  plt.close('all')
+
+  # ----------------------------------------
+  # Largest training run yearly growth plot
+  # ----------------------------------------
+  idx_end_lr_growth = idx_end_lr  # same cap year selected above
+  if idx_end_lr_growth - delta_idx > 0:
+    x_lr_growth = model.timesteps[delta_idx:idx_end_lr_growth]
+    y_lr_growth = np.log(model.biggest_training_run[delta_idx:idx_end_lr_growth] / model.biggest_training_run[:idx_end_lr_growth-delta_idx])
+
+    plt.figure(figsize=(14, 8), dpi=80)
+    plt.plot(x_lr_growth, y_lr_growth, color='green', label='Largest training run growth')
+    model._plot_vlines()
+
+    ax = plt.gca()
+    ax.xaxis.set_major_formatter(_mticker.FuncFormatter(lambda val, pos: f"{int(val + 3)}"))
+    ax.xaxis.set_major_locator(_mticker.MultipleLocator(1))
+    plt.legend()
+    plt.title('Largest training run yearly growth rate')
+    plt.ylabel('ln growth per year')
+    _customise_axis(ax)
+    plt.savefig(os.path.join(plot_dir, 'largest_training_run_growth.png'), dpi=300, bbox_inches='tight')
+    plt.close('all')
