@@ -3,6 +3,7 @@ import inspect
 import matplotlib.pyplot as plt
 import pandas as pd
 import math
+import matplotlib.ticker as _mticker
 
 from . import utils
 from .utils import get_option, get_parameter_table, init_cli_arguments, handle_cli_arguments
@@ -137,7 +138,13 @@ class SimulateTakeOff():
 
       disable_automation = None,
 
+      # Metadata
+      title = None,
+
       n_labour_tasks = 100,
+
+      # Metadata / feature flags
+      runtime_training_tradeoff_enabled = True,
       ):
 
     if t_start is None: t_start = get_option('t_start', 2022)
@@ -1294,13 +1301,16 @@ class SimulateTakeOff():
     not self.frac_automatable_tasks_goods_no_tradeoff[t_idx-2] >= 1:
       self.agi_year = t_year
 
-    def update_frac_input(current_frac, growth_rate, growth_rate_rampup, max_frac):
-      frac = current_frac\
-      * np.exp(self.t_step *
-               (growth_rate_rampup if self.rampup[t_idx] else growth_rate)
-               )
-      frac = min(frac, max_frac)
-      return frac
+    def update_frac_input(current_frac, growth_param, growth_param_rampup, max_frac):
+      # Select the appropriate growth parameter (normal vs ramp-up) and
+      # convert it to a numeric value for the current timestep.
+      rate = self._param_value(
+        growth_param_rampup if self.rampup[t_idx] else growth_param,
+        t_idx,
+        t_year,
+      )
+      frac = current_frac * np.exp(self.t_step * rate)
+      return min(frac, max_frac)
 
     # Hacky loop
     frac_metrics = [
@@ -1793,8 +1803,8 @@ class SimulateTakeOff():
     # Time from powerful sub-AGI to AGI
     self.takeoff_metrics['sub_agi_to_agi'] = self.agi_year - self.sub_agi_year if (self.agi_year is not None) else np.nan
 
-    # Years from “total cognitive output is 2X human cognitive output” to
-    # “total cognitive output is 10X human cognitive output”
+    # Years from "total cognitive output is 2X human cognitive output" to
+    # "total cognitive output is 10X human cognitive output"
     self.takeoff_metrics["cog_output_multiplier"] = \
       self.length_between_thresholds(
           self.automation_multiplier_rnd > 2,
@@ -1833,12 +1843,11 @@ class SimulateTakeOff():
 
   ## VISUALIZATION ##
 
-  def plot(self, metric, plot_growth = False, new_figure=True, line_color='black', crop_after_full_automation = True):
+  def plot(self, metric, plot_growth = False, new_figure=True, line_color='black', crop_after_full_automation = True, year_shift=0):
     """ Plot a metric over time.
         Eg gwp, compute, capital, labour, hardware_efficiency, software, hardware
     """
     x = self.timesteps
-    y = getattr(self, metric)
 
     if crop_after_full_automation:
       full_automation_year = self.timeline_metrics['automation_gns_100%']
@@ -1846,7 +1855,7 @@ class SimulateTakeOff():
       idx_end = min(self.time_to_index(full_automation_year+5), self.t_idx) \
                 if not np.isnan(full_automation_year) and crop_after_full_automation else self.t_idx
       x = x[:idx_end]
-      y = y[:idx_end]
+      y = getattr(self, metric)[:idx_end]
 
     if plot_growth:
       # Plot annual growth
@@ -1865,6 +1874,12 @@ class SimulateTakeOff():
       plt.title(f"{metric} over time")
 
     self._plot_vlines(line_color = line_color)
+
+    # Shift x-axis labels without moving data
+    if year_shift != 0:
+      ax = plt.gca()
+      ax.xaxis.set_major_formatter(_mticker.FuncFormatter(lambda val, pos: f"{int(val + year_shift)}"))
+      ax.xaxis.set_major_locator(_mticker.MultipleLocator(1))
 
   def _plot_vlines(self, line_color = 'black'):
 
@@ -1885,8 +1900,6 @@ class SimulateTakeOff():
                 linestyle='dashed',
                 color=line_color,
                 label='100% automation')
-
-
 
   def plot_compute_decomposition(self, new_figure = True, crop_after_full_automation = True, crop_at_year = None):
     """ Show the growth of the factors that drive compute
@@ -2076,23 +2089,127 @@ class SimulateTakeOff():
     # Set the title for the whole plot
     plt.suptitle('Fractional inputs')
 
+  def _param_value(self, param, t_idx, t_year):
+    """Return the value of a (potentially) time-varying parameter.
+
+    Supported formats for *param*:
+      • scalar (int/float) – interpreted as a constant value.
+      • callable – called with *t_year* and its return value is used.
+      • sequence (list/tuple/np.ndarray) – interpreted as one value per
+        simulation step starting from *t_start*.  If the simulation runs
+        longer than the provided sequence, the last element is repeated.
+      • dict – keys are calendar years and the value for the latest year
+        not greater than *t_year* is used (piece-wise constant).
+    """
+    # Constant scalar
+    if np.isscalar(param):
+      return param
+
+    # Callable – let the user compute the value on the fly
+    if callable(param):
+      return param(t_year)
+
+    # Sequence indexed by timestep
+    if isinstance(param, (list, tuple, np.ndarray)):
+      if t_idx < len(param):
+        return param[int(t_idx)]
+      # Past the end – keep the last value constant
+      return param[-1]
+
+    # Dict keyed by (calendar) year
+    if isinstance(param, dict):
+      if not param:
+        raise ValueError("Time-series parameter dictionary is empty")
+      years = sorted(param.keys())
+      for y in reversed(years):
+        if t_year >= y:
+          return param[y]
+      # If t_year precedes the earliest key, return the first value
+      return param[years[0]]
+
+    raise ValueError(f"Unsupported type for time-series parameter: {type(param)}")
+
 if __name__ == "__main__":
   # Handle CLI arguments
   parser = init_cli_arguments()
   args = handle_cli_arguments(parser)
 
-  # Retrieve parameter estimates from spreadsheet
-  parameter_table = get_parameter_table(tradeoff_enabled="from_spreadsheet")
-  best_guess_parameters = {parameter : row['Best guess'] for parameter, row in parameter_table.iterrows()}
+  # Determine parameters source (JSON file vs spreadsheet)
+  if getattr(args, 'param_json', None):
+    title, json_params = utils.load_parameters_from_json(args.param_json)
+    model = SimulateTakeOff(**json_params, title=title)
+  else:
+    # Retrieve parameter estimates from spreadsheet
+    parameter_table = get_parameter_table(tradeoff_enabled="from_spreadsheet")
+    best_guess_parameters = {parameter : row['Best guess'] for parameter, row in parameter_table.iterrows()}
+    model = SimulateTakeOff(**best_guess_parameters)
 
-  # Run model
-  model = SimulateTakeOff(**best_guess_parameters)
   model.run_simulation()
 
   # Plot things
-  model.plot('gwp')
-  model.plot('gwp', plot_growth=True)
-  model.plot_compute_decomposition()
-  plt.show()
-  model.display_summary_table()
-  model.display_takeoff_metrics()
+  model.plot('gwp', year_shift=3)
+  # Label the main GWP curve for the legend
+  if plt.gca().lines:
+    plt.gca().lines[0].set_label('GWP')
+  plt.legend()
+
+  # Save the figure (do not display it)
+  import os
+  plot_dir = os.path.join(os.getcwd(), 'plots')
+  os.makedirs(plot_dir, exist_ok=True)
+  plt.savefig(os.path.join(plot_dir, 'gwp.png'), dpi=300, bbox_inches='tight')
+  plt.close('all')
+
+  # Automation percentage plot (Goods and R&D)
+  plt.figure(figsize=(14,8), dpi=80)
+  full_auto_year = model.timeline_metrics['automation_gns_100%']
+  if np.isnan(full_auto_year):
+    idx_end = model.t_idx
+  else:
+    idx_end = model.time_to_index(full_auto_year + 1)  # one year after full automation
+    idx_end = min(idx_end, model.t_idx)
+
+  x = model.timesteps[:idx_end]
+  plt.plot(x, model.frac_tasks_automated_goods[:idx_end] * 100, label='Goods', color='blue')
+  plt.plot(x, model.frac_tasks_automated_rnd[:idx_end] * 100, label='R&D', color='orange')
+  plt.ylabel('Percentage of tasks automated')
+  plt.ylim(0, 100)
+  model._plot_vlines()
+  # Shift x-axis labels
+  import matplotlib.ticker as _mticker
+  ax = plt.gca()
+  ax.xaxis.set_major_formatter(_mticker.FuncFormatter(lambda val, pos: f"{int(val + 3)}"))
+  ax.xaxis.set_major_locator(_mticker.MultipleLocator(1))
+  plt.legend()
+  plt.title('Automation percentage over time')
+
+  plt.savefig(os.path.join(plot_dir, 'automation_percent.png'), dpi=300, bbox_inches='tight')
+  plt.close('all')
+
+  # No additional plots are generated or shown
+
+  # Largest training run plot (FLOP per year)
+  plt.figure(figsize=(14,8), dpi=80)
+  # Cap the x-axis at the year 2035 (or end of simulation if sooner)
+  cap_year = 2035
+  idx_end_lr = min(model.time_to_index(cap_year), model.t_idx)
+  x = model.timesteps[:idx_end_lr]
+  plt.plot(x, model.biggest_training_run[:idx_end_lr], color='green', label='Largest training run')
+  # Use logarithmic scale so the curve isn't squashed near zero and set a sensible lower bound
+  plt.yscale('log')
+  if len(model.biggest_training_run) > 0:
+    ymin = model.biggest_training_run[0] * 0.8  # start slightly below first value
+    ax = plt.gca()
+    ymax = ax.get_ylim()[1]
+    ax.set_ylim(bottom=ymin, top=ymax)
+  ax = plt.gca()
+  ax.xaxis.set_major_formatter(_mticker.FuncFormatter(lambda val, pos: f"{int(val + 3)}"))
+  ax.xaxis.set_major_locator(_mticker.MultipleLocator(1))
+  if len(x) > 0:
+    ax.set_xlim(left=x[0])
+  plt.title('Largest training run over time')
+  # Add vertical milestone lines (wake-up, 20 % & 100 % automation)
+  model._plot_vlines()
+  plt.legend()
+  plt.savefig(os.path.join(plot_dir, 'largest_training_run.png'), dpi=300, bbox_inches='tight')
+  plt.close('all')

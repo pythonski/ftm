@@ -492,6 +492,13 @@ def init_cli_arguments():
   )
 
   parser.add_argument(
+    "-j",
+    "--param-json",
+    default=None,
+    help="Path to a JSON file containing simulation parameters. If provided, this overrides the parameters read from the spreadsheet."
+  )
+
+  parser.add_argument(
     "--human-names",
     action='store_true',
     default=None,
@@ -634,3 +641,53 @@ class Log:
       print((' ' * self.indentation_level) + line, file = out, end = end)
 
 log = Log(level=Log.TRACE_LEVEL)
+
+#--------------------------------------------------------------------------
+# Parameter JSON handling
+#--------------------------------------------------------------------------
+
+def load_parameters_from_json(json_path):
+  """Load simulation parameters from a JSON file.
+
+  The JSON file should contain a mapping from parameter names to their values
+  (using the same snake_case names that the code expects).  If the JSON file
+  contains a key called ``title`` its value is returned separately so that it
+  can be stored alongside the simulation results but will not be forwarded as
+  a model parameter.
+
+  Any keys that do not correspond to a parameter of :pyclass:`SimulateTakeOff`
+  are ignored, in order to allow the JSON to contain comments / auxiliary
+  fields without breaking the simulation.
+
+  Parameters
+  ----------
+  json_path : str
+      Path to the JSON file.
+
+  Returns
+  -------
+  tuple
+      ``(title, params)`` where *title* is either the value stored under the
+      ``title`` key or ``None`` if absent, and *params* is a ``dict`` suitable
+      for ``SimulateTakeOff`` keyword-initialisation.
+  """
+
+  import json
+  from ftm.core.model import SimulateTakeOff  # local import to avoid cycles
+
+  with open(json_path, "r") as f:
+    data = json.load(f)
+
+  # Extract an optional title
+  title = data.pop("title", None)
+
+  # Keep only recognised parameters
+  valid_keys = set(inspect.signature(SimulateTakeOff).parameters.keys())
+  params = {k: v for k, v in data.items() if k in valid_keys}
+
+  # Warn about any unknown keys (but continue)
+  unknown_keys = set(data.keys()) - valid_keys
+  if unknown_keys:
+    print(f"[utils] Warning: ignoring unknown parameter keys in JSON: {unknown_keys}")
+
+  return title, params
