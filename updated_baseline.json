@@ -67,5 +67,15 @@
   "money_cap_training_before_wakeup": 4e9,
   "training_requirements_steepness": 0,
   "runtime_requirements_steepness": 0,
-  "runtime_training_tradeoff_enabled": true
+  "runtime_training_tradeoff_enabled": true,
+  "frac_gwp_compute_growth_cooldown": -0.05,
+  "frac_capital_hardware_rnd_growth_cooldown": -0.02,
+  "frac_labour_hardware_rnd_growth_cooldown": -0.02,
+  "frac_compute_hardware_rnd_growth_cooldown": -0.05,
+  "frac_labour_software_rnd_growth_cooldown": -0.1,
+  "frac_compute_software_rnd_growth_cooldown": -0.05,
+  "frac_compute_training_growth_cooldown": -0.05,
+  "cooldown_threshold": 0.4,
+  "cooldown_window": 1,
+  "cooldown_enabled": true
 }

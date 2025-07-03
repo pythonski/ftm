@@ -1,6 +1,6 @@
 {
   "title": "updated_conservative",
-  "full_automation_requirements_training": 2e40,
+  "full_automation_requirements_training": 2e38,
   "flop_gap_training": 1e8,
   "goods_vs_rnd_requirements_training": 1,
   "full_automation_requirements_runtime": 1e20,
@@ -15,7 +15,7 @@
   "frac_compute_training_growth_rampup": 1.5,
   "frac_compute_training_ceiling": 0.1,
   "initial_biggest_training_run": 6e25,
-  "rampup_trigger": 0.06,
+  "rampup_trigger": 0.01,
   "flop_gap_runtime": 100,
   "goods_vs_rnd_requirements_runtime": 30,
   "runtime_training_tradeoff": 1.5,
@@ -70,11 +70,12 @@
   "runtime_training_tradeoff_enabled": true,
   "frac_gwp_compute_growth_cooldown": -0.05,
   "frac_capital_hardware_rnd_growth_cooldown": -0.02,
-  "frac_labour_hardware_rnd_growth_cooldown": -0.02,
-  "frac_compute_hardware_rnd_growth_cooldown": -0.05,
+  "frac_labour_hardware_rnd_growth_cooldown": -0.12,
+  "frac_compute_hardware_rnd_growth_cooldown": -0.15,
   "frac_labour_software_rnd_growth_cooldown": -0.1,
-  "frac_compute_software_rnd_growth_cooldown": -0.05,
+  "frac_compute_software_rnd_growth_cooldown": -0.15,
   "frac_compute_training_growth_cooldown": -0.3,
-  "cooldown_threshold": 0.4,
-  "cooldown_window": 1
+  "cooldown_threshold": 0.25,
+  "cooldown_window": 1,
+  "cooldown_enabled": true
 }

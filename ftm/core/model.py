@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import math
 import matplotlib.ticker as _mticker
+import os
 
 from . import utils
 from .utils import get_option, get_parameter_table, init_cli_arguments, handle_cli_arguments
@@ -160,6 +161,7 @@ class SimulateTakeOff():
       # Cool-down trigger parameters
       cooldown_threshold = 0.25,
       cooldown_window = 2,
+      cooldown_enabled = True,
       ):
 
     if t_start is None: t_start = get_option('t_start', 2022)
@@ -1335,7 +1337,7 @@ class SimulateTakeOff():
     prev_cool = self.cooldown[t_idx-1] if t_idx > 1 else False
     self.cooldown[t_idx] = False
     window_idx = int(round(cooldown_window / self.t_step))
-    if t_idx - 1 - window_idx >= 0:
+    if self.cooldown_enabled and t_idx - 1 - window_idx >= 0:
       auto_now = self.frac_tasks_automated_goods[t_idx-1]
 
       # Do not enter cool-down once the economy is fully automated
@@ -1354,6 +1356,11 @@ class SimulateTakeOff():
       else:
         # Fully automated – never cool down afterwards
         self.cooldown[t_idx] = False
+
+    # When cooldown happens, override rampup to False
+    # (but preserve rampup_start for plotting purposes)
+    if self.cooldown[t_idx]:
+      self.rampup[t_idx] = False
 
     def update_frac_input(current_frac, growth_param, growth_param_rampup, growth_param_cooldown, max_frac):
       """Update a fractional input under normal, ramp-up, or cool-down."""
@@ -1810,6 +1817,8 @@ class SimulateTakeOff():
     unsorted_metrics['agi_year']     = self.agi_year
     unsorted_metrics['rampup_start'] = self.rampup_start
 
+    print(f"Ramp-up start time: {self.rampup_start}")
+
     self.timeline_metrics = {}
     for k in SimulateTakeOff.timeline_metrics:
       v = unsorted_metrics[k]
@@ -1939,14 +1948,15 @@ class SimulateTakeOff():
       ax.xaxis.set_major_locator(_mticker.MultipleLocator(1))
 
   def _plot_vlines(self, line_color = 'black'):
-
-    if self.rampup_start:
-      plt.axvline(self.rampup_start,
+    rampup_start = self.timeline_metrics.get('rampup_start')
+    if rampup_start is not None and not np.isnan(rampup_start):
+      plt.axvline(rampup_start,
                 linestyle='dotted',
-                color=line_color,
+                color='red',
                 label='Wake up')
 
-    if self.rampup_mid:
+    rampup_mid = getattr(self, 'rampup_mid', None)
+    if rampup_mid is not None:
       plt.axvline(self.rampup_mid,
                 linestyle='-.',
                 color=line_color,
@@ -2220,19 +2230,24 @@ if __name__ == "__main__":
   # truncate all figures at (calendar) year 2050.
   updated_conservative = (title == 'updated_conservative')
   _YEAR_SHIFT = 3  # All existing plots display years shifted by +3
-  _PLOT_CAP_YEAR = 2050
+  _PLOT_CAP_YEAR = 2100
   _PLOT_CAP_X = _PLOT_CAP_YEAR - _YEAR_SHIFT  # coordinate after shift
 
   def _customise_axis(ax):
-    """Apply the special x-axis formatting for the updated_conservative case."""
-    if not updated_conservative:
-      return
-    # Show a label every 5 years and cap the visible range.
-    ax.xaxis.set_major_locator(_mticker.MultipleLocator(5))
-    # Preserve existing left bound if present but cap the right bound.
-    xmin, xmax = ax.get_xlim()
-    xmin = xmin  # keep whatever is already set
-    ax.set_xlim(left=xmin, right=min(xmax, _PLOT_CAP_X))
+    """Apply axis customizations."""
+    _PLOT_START_YEAR = 2025
+    _PLOT_START_X = _PLOT_START_YEAR - _YEAR_SHIFT # This is 2022
+
+    # Set the left boundary for all cases
+    ax.set_xlim(left=_PLOT_START_X)
+
+    if updated_conservative:
+      # Apply additional customizations for the conservative case
+      ax.xaxis.set_major_locator(_mticker.MultipleLocator(5))
+      
+      # Cap the right boundary
+      _, xmax = ax.get_xlim()
+      ax.set_xlim(right=min(xmax, _PLOT_CAP_X))
 
   # -------------------------------------------------------------------------
   # Plot things
@@ -2247,7 +2262,17 @@ if __name__ == "__main__":
 
   # Save the figure (do not display it)
   import os
-  plot_dir = os.path.join(os.getcwd(), 'plots')
+  # Choose output directory based on scenario title
+  if updated_conservative:
+    _PLOT_DIR_NAME = 'conservative_plots'
+  elif title == 'updated_baseline':
+    _PLOT_DIR_NAME = 'baseline_plots'
+  else:
+    _PLOT_DIR_NAME = 'plots'
+
+  # Ensure plots are stored inside the ftm/ftm package directory (one level above this file)
+  _BASE_PLOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+  plot_dir = os.path.join(_BASE_PLOT_DIR, _PLOT_DIR_NAME)
   os.makedirs(plot_dir, exist_ok=True)
   plt.savefig(os.path.join(plot_dir, 'gwp.png'), dpi=300, bbox_inches='tight')
   plt.close('all')
@@ -2286,7 +2311,7 @@ if __name__ == "__main__":
   # Largest training run plot (FLOP per year)
   plt.figure(figsize=(14,8), dpi=80)
   # Cap the x-axis at the year 2035 (or end of simulation if sooner)
-  cap_year = 2050 if updated_conservative else 2035
+  cap_year = 2100 if updated_conservative else 2035
   idx_end_lr = min(model.time_to_index(cap_year), model.t_idx)
   x = model.timesteps[:idx_end_lr]
   plt.plot(x, model.biggest_training_run[:idx_end_lr], color='green', label='Largest training run')
@@ -2298,14 +2323,7 @@ if __name__ == "__main__":
     # Check whether the series declines after the peak
     if peak_idx < len(y_lr) - 1 and y_lr[-1] < peak_y:
       peak_x = x[peak_idx]
-      # Draw a horizontal dashed line from the peak to the end of the visible range
-      plt.hlines(peak_y, peak_x, x[-1], colors='red', linestyles='dashed', label='Peak largest run')
-      # Annotate the peak value (slightly above the line to avoid overlap)
-      plt.annotate(f"Peak: {peak_y:.2e}",
-                   xy=(peak_x, peak_y),
-                   xytext=(peak_x, peak_y * 1.1),
-                   arrowprops=dict(arrowstyle='->', color='red'),
-                   color='red')
+      # Peak line and annotation removed as requested
   # Use logarithmic scale so the curve isn't squashed near zero and set a sensible lower bound
   plt.yscale('log')
   if len(model.biggest_training_run) > 0:
@@ -2330,7 +2348,7 @@ if __name__ == "__main__":
   # GWP yearly growth rate plot
   # ----------------------------
   delta_idx = int(1 / model.t_step)
-  cap_year_growth = 2050 if updated_conservative else 2035
+  cap_year_growth = 2100 if updated_conservative else 2035
   idx_end_growth = min(model.time_to_index(cap_year_growth), model.t_idx)
 
   x_growth = model.timesteps[delta_idx:idx_end_growth]
