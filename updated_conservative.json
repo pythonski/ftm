@@ -37,6 +37,7 @@
   "frac_compute_hardware_rnd_growth_rampup": 0.27,
   "frac_labour_software_rnd_growth_rampup": 0.32,
   "frac_compute_software_rnd_growth_rampup": 0.27,
+  "rampup_enabled": true,
   "frac_capital_hardware_rnd_ceiling": 0.01,
   "frac_labour_hardware_rnd_ceiling": 0.01,
   "frac_compute_hardware_rnd_ceiling": 0.05,
