@@ -1,6 +1,6 @@
 {
   "title": "updated_baseline",
-  "full_automation_requirements_training": 2e33,
+  "full_automation_requirements_training": 2e36,
   "flop_gap_training": 1e4,
   "goods_vs_rnd_requirements_training": 3,
   "full_automation_requirements_runtime": 1.6e17,

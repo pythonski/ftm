@@ -146,6 +146,7 @@ class SimulateTakeOff():
 
       # Metadata / feature flags
       runtime_training_tradeoff_enabled = True,
+      rampup_enabled = True,
 
       # Fractional inputs cooldown growth rates
       frac_capital_hardware_rnd_growth_cooldown = 0,
@@ -1305,9 +1306,12 @@ class SimulateTakeOff():
 
   def allocate_fractional_inputs(self, t_idx):
 
-    # Rampup
-    self.rampup[t_idx] = \
-      self.frac_tasks_automated_goods[t_idx-1] >= self.rampup_trigger
+    # Ramp-up detection (only if enabled)
+    if self.rampup_enabled:
+      self.rampup[t_idx] = \
+        self.frac_tasks_automated_goods[t_idx-1] >= self.rampup_trigger
+    else:
+      self.rampup[t_idx] = False
 
     t_year = self.index_to_time(t_idx) - self.t_step
     if self.rampup[t_idx] and not self.rampup[t_idx-1]:
