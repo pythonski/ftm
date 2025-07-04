@@ -162,6 +162,18 @@ class SimulateTakeOff():
       cooldown_threshold = 0.25,
       cooldown_window = 2,
       cooldown_enabled = True,
+
+      # ROI-based regime switching -------------------------------
+      # Projected cash-flow window (years) to evaluate training ROI
+      roi_time_window = 5,
+      # Fraction of the extra economic value that the model owner can capture
+      capture_share = 0.5,
+      # Annual discount rate used for present-value calculations
+      roi_discount_rate = 0.03,
+      # ROI threshold above which we enter the ramp-up regime
+      roi_ramp_threshold = 1.2,
+      # ROI threshold below which we enter the cool-down regime
+      roi_cool_threshold = 0.9,
       ):
 
     if t_start is None: t_start = get_option('t_start', 2022)
@@ -435,6 +447,9 @@ class SimulateTakeOff():
 
     # Cool-down phase indicator (mirrors ramp-up but for slow automation periods)
     self.state_def.cooldown = self.state_var(dtype=bool)
+
+    # Return-on-investment for training compute
+    self.state_def.roi = self.state_var()
 
   def create_simulation_state_total_input(self):
     self.state_def.capital = self.state_var()
@@ -1305,11 +1320,52 @@ class SimulateTakeOff():
 
   def allocate_fractional_inputs(self, t_idx):
 
-    # Rampup
-    self.rampup[t_idx] = \
-      self.frac_tasks_automated_goods[t_idx-1] >= self.rampup_trigger
+    # ------------------------------------------------------------
+    # ROI-based regime determination
+    # ------------------------------------------------------------
 
     t_year = self.index_to_time(t_idx) - self.t_step
+
+    # Compute ROI for training investments (requires at least 2 past timesteps)
+    if t_idx >= 2:
+      delta_tasks = self.frac_tasks_automated_goods[t_idx-1] - self.frac_tasks_automated_goods[t_idx-2]
+
+      labour_share = self.labour_share_goods[t_idx-1] if self.compute_shares else 0.4  # fallback constant
+
+      delta_value = labour_share * self.gwp[t_idx-1] * delta_tasks
+
+      # Present value of the cash-flows over the ROI window
+      if self.roi_discount_rate == 0:
+        pv_factor = self.roi_time_window  # Avoid division by zero – simple multiple
+      else:
+        pv_factor = (1 - np.exp(-self.roi_discount_rate * self.roi_time_window)) / self.roi_discount_rate
+
+      PV = self.capture_share * delta_value * pv_factor
+
+      cost = self.money_spent_training[t_idx-1]
+      roi = PV / cost if cost > 0 else np.inf
+    else:
+      roi = 0.0
+
+    # Store ROI for diagnostics
+    self.roi[t_idx] = roi
+
+    # Determine growth regime
+    self.rampup[t_idx] = roi >= self.roi_ramp_threshold
+    self.cooldown[t_idx] = self.cooldown_enabled and (roi <= self.roi_cool_threshold)
+
+    # Ensure mutual exclusivity (cool-down overrides ramp-up)
+    if self.cooldown[t_idx]:
+      self.rampup[t_idx] = False
+
+    # Record first calendar year entering cool-down
+    if self.cooldown[t_idx] and not (self.cooldown[t_idx-1] if t_idx > 1 else False):
+      self.cooldown_start = t_year
+
+    # -----------------------
+    # Milestone bookkeeping
+    # -----------------------
+
     if self.rampup[t_idx] and not self.rampup[t_idx-1]:
       self.rampup_start = t_year
 
@@ -1325,42 +1381,11 @@ class SimulateTakeOff():
     not self.frac_automatable_tasks_goods_no_tradeoff[t_idx-2] >= 1:
       self.agi_year = t_year
 
+    # (Previous relative-increase-based cool-down logic removed – now handled by ROI thresholds)
+
     # ------------------------------------------------------------
-    # Cool-down detection: check relative increase in automation
-    # over a window *T* years. If the increase is below a threshold
-    # *x*, mark the current timestep as being in cool-down.
+    # Update fractional inputs depending on the current regime
     # ------------------------------------------------------------
-
-    cooldown_window = getattr(self, 'cooldown_window', 1.0)      # years
-    cooldown_threshold = getattr(self, 'cooldown_threshold', 0.05)  # 5 % relative
-
-    prev_cool = self.cooldown[t_idx-1] if t_idx > 1 else False
-    self.cooldown[t_idx] = False
-    window_idx = int(round(cooldown_window / self.t_step))
-    if self.cooldown_enabled and t_idx - 1 - window_idx >= 0:
-      auto_now = self.frac_tasks_automated_goods[t_idx-1]
-
-      # Do not enter cool-down once the economy is fully automated
-      if auto_now < 1.0:
-        auto_prev = self.frac_tasks_automated_goods[t_idx-1-window_idx]
-        if auto_prev > 0:
-          rel_inc = (auto_now - auto_prev) / auto_prev
-        else:
-          rel_inc = np.inf  # Treat as large increase if base is ~0
-
-        self.cooldown[t_idx] = rel_inc < cooldown_threshold
-
-        # Store the first calendar year that cooldown begins
-        if self.cooldown[t_idx] and not prev_cool:
-          self.cooldown_start = t_year
-      else:
-        # Fully automated – never cool down afterwards
-        self.cooldown[t_idx] = False
-
-    # When cooldown happens, override rampup to False
-    # (but preserve rampup_start for plotting purposes)
-    if self.cooldown[t_idx]:
-      self.rampup[t_idx] = False
 
     def update_frac_input(current_frac, growth_param, growth_param_rampup, growth_param_cooldown, max_frac):
       """Update a fractional input under normal, ramp-up, or cool-down."""
@@ -1375,7 +1400,7 @@ class SimulateTakeOff():
       frac = current_frac * np.exp(self.t_step * rate)
       return min(frac, max_frac)
 
-    # Hacky loop
+    # Metrics whose fractions evolve over time
     frac_metrics = [
       'frac_gwp_compute',
       'frac_capital_hardware_rnd',
@@ -1384,32 +1409,26 @@ class SimulateTakeOff():
       'frac_labour_software_rnd',
       'frac_compute_software_rnd',
       'frac_compute_training'
-      ]
+    ]
 
     for frac_metric in frac_metrics:
-      getattr(self, frac_metric)[t_idx] = \
-        update_frac_input(
-          getattr(self, frac_metric)[t_idx-1],
-          getattr(self, f'{frac_metric}_growth'),
-          getattr(self, f'{frac_metric}_growth_rampup'),
-          getattr(self, f'{frac_metric}_growth_cooldown', 0),
-          getattr(self, f'{frac_metric}_ceiling'),
-        )
+      getattr(self, frac_metric)[t_idx] = update_frac_input(
+        getattr(self, frac_metric)[t_idx-1],
+        getattr(self, f'{frac_metric}_growth'),
+        getattr(self, f'{frac_metric}_growth_rampup'),
+        getattr(self, f'{frac_metric}_growth_cooldown', 0),
+        getattr(self, f'{frac_metric}_ceiling'),
+      )
 
-    # Cap the growth of the fraction of FLOP before rampup
-    if self.money_spent_training[t_idx-1] > self.money_cap_training_before_wakeup \
-    and not self.rampup[t_idx-1]:
+    # Prevent runaway training spend before wake-up
+    if self.money_spent_training[t_idx-1] > self.money_cap_training_before_wakeup and not self.rampup[t_idx-1]:
       self.frac_compute_training[t_idx] = self.frac_compute_training[t_idx-1]
 
-    # Goods production fractional inputs
-    self.frac_capital_goods[t_idx] = \
-      1 - self.frac_capital_hardware_rnd[t_idx]
-    self.frac_labour_goods[t_idx] = \
-      1 - self.frac_labour_hardware_rnd[t_idx] - self.frac_labour_software_rnd[t_idx]
-    self.frac_compute_goods[t_idx] = \
-      1 - self.frac_compute_hardware_rnd[t_idx] - self.frac_compute_software_rnd[t_idx] \
-        - self.frac_compute_training[t_idx]
- 
+    # Derive goods-sector input shares from updated R&D + training shares
+    self.frac_capital_goods[t_idx] = 1 - self.frac_capital_hardware_rnd[t_idx]
+    self.frac_labour_goods[t_idx] = 1 - self.frac_labour_hardware_rnd[t_idx] - self.frac_labour_software_rnd[t_idx]
+    self.frac_compute_goods[t_idx] = 1 - self.frac_compute_hardware_rnd[t_idx] - self.frac_compute_software_rnd[t_idx] - self.frac_compute_training[t_idx]
+
   def calculate_total_inputs(self, t_idx):
 
     # Compute
@@ -1801,6 +1820,7 @@ class SimulateTakeOff():
     'automation_rnd_20%',
     'automation_rnd_100%',
     'rampup_start',
+    'cooldown_start',
   ]
 
   def compute_timeline_metrics(self):
@@ -1816,8 +1836,11 @@ class SimulateTakeOff():
     unsorted_metrics['sub_agi_year'] = self.sub_agi_year
     unsorted_metrics['agi_year']     = self.agi_year
     unsorted_metrics['rampup_start'] = self.rampup_start
+    unsorted_metrics['cooldown_start'] = self.cooldown_start
 
     print(f"Ramp-up start time: {self.rampup_start}")
+    if self.cooldown_start is not None:
+      print(f"Cool-down start time: {self.cooldown_start}")
 
     self.timeline_metrics = {}
     for k in SimulateTakeOff.timeline_metrics:

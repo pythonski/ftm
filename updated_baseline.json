@@ -77,5 +77,10 @@
   "frac_compute_training_growth_cooldown": -0.05,
   "cooldown_threshold": 0.4,
   "cooldown_window": 1,
-  "cooldown_enabled": true
+  "cooldown_enabled": true,
+  "roi_time_window": 1,
+  "capture_share": 0.1,
+  "roi_discount_rate": 0.3,
+  "roi_ramp_threshold": 1e4,
+  "roi_cool_threshold": 1.0
 }
